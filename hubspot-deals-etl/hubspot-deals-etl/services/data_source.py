@@ -4,7 +4,6 @@ from typing import Dict, List, Any, Iterator, Optional, Callable
 from datetime import datetime, timezone
 from .api_service import APIService
 from loki_logger import get_logger, log_business_event, log_security_event
-from .api_service import APIService
 
 def create_data_source(
     job_config: Dict[str, Any],
@@ -29,14 +28,12 @@ def create_data_source(
     if not organization_id:
         raise ValueError("No organization ID found in job configuration")
 
-    #  To Be Removed Later
     logger.info(
-        "Starting Hubspot_Deals data extraction",
+        "Starting HubSpot deals data extraction",
         extra={
             "organization_id": organization_id,
-            "filters": filters,
-            "auth_config": auth_config,
-            "job_config": job_config,
+            "job_id": filters.get("scan_id", "unknown"),
+            "source": "hubspot_deals",
         },
     )
 
@@ -45,11 +42,7 @@ def create_data_source(
         """
         Extract main data from Hubspot_Deals API with checkpoint support
 
-        TODO: Customize for Hubspot_Deals:
-        - Update resource name and primary_key
-        - Adjust API calls and pagination
-        - Modify data transformation logic
-        """
+                """
 
         # Initialize state
         if resume_from:
@@ -182,15 +175,29 @@ def create_data_source(
     access_token=access_token,
     limit=100,
     after=after,
-    properties="dealname,amount,dealstage,pipeline,closedate,hubspot_owner_id,dealtype,description,hs_forecast_amount,hs_forecast_category,hs_deal_stage_probability,hs_is_closed,hs_is_closed_won",
+    properties="dealname,amount,dealstage,pipeline,closedate,hubspot_owner_id,dealtype,description,hs_forecast_amount,hs_forecast_category,hs_deal_stage_probability,hs_is_closed,hs_is_closed_won,createdate,hs_lastmodifieddate",
+    associations="contacts,companies",
 )
 
                 page_records = 0
 
-                # TODO: Update data processing based on Hubspot_Deals response structure
-                data_key = "results"  # Update based on API response
+                records_to_skip = (
+                    resume_from.get("records_completed_in_page", 0)
+                    if resume_from
+                    and page_count == resume_from.get("page_number", -1)
+                    else 0
+                )
+                records_completed_in_page = records_to_skip
+
+                # HubSpot CRM objects list response
+                data_key = "results"
                 if data_key in data and data[data_key]:
                     for record in data[data_key]:
+
+                        if records_to_skip > 0:
+                            records_to_skip -= 1
+                            continue
+
                         # Check for pause/cancel even within record processing for faster response
                         if check_pause_callback and check_pause_callback(job_id):
                             logger.info(
@@ -217,7 +224,9 @@ def create_data_source(
                                         "checkpoint_data": {
                                             "pause_reason": "user_requested_mid_page",
                                             "paused_at_page": page_count,
-                                            "records_completed_in_page": page_records,
+                                            "records_completed_in_page": (
+                                                records_completed_in_page + page_records
+                                            ),
                                             "paused_at": datetime.now(
                                                 timezone.utc
                                             ).isoformat(),
@@ -265,14 +274,28 @@ def create_data_source(
                             "raw_data": record,
                         }
 
+                        associations = record.get("associations") or {}
+
+                        contact_results = (
+                          associations.get("contacts", {}).get("results", [])
+                        )
+                        company_results = (
+                          associations.get("companies", {}).get("results", [])
+                        )
+
+                        filtered_record["associated_contact_ids"] = [
+                          item["id"] for item in contact_results if item.get("id")
+                        ]
+
+                        filtered_record["associated_company_ids"] = [
+                          item["id"] for item in company_results if item.get("id")
+                        ]
                         # Add extraction metadata
                         filtered_record.update(
                             {
                                 "_extracted_at": datetime.now(timezone.utc).isoformat(),
                                 "_scan_id": filters.get("scan_id", "unknown"),
-                                "_organization_id": filters.get(
-                                    "organization_id", "unknown"
-                                ),
+                                "_organization_id": organization_id or "unknown",
                                 "_page_number": page_count + 1,
                                 "_source_service": "hubspot_deals",
                             }

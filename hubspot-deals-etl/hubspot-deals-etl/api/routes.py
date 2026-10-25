@@ -128,7 +128,10 @@ def create_api():
                     }, 409
 
                 # Start scan
-                executor.submit(asyncio.run, extraction_service.start_scan(validated_config))
+                executor.submit(
+                    asyncio.run,
+                    extraction_service.start_scan(validated_config)
+                )
                 
                 logger.info(
                     "Scan accepted for processing",
@@ -827,6 +830,49 @@ def create_api():
                     "success": False,
                     "message": f"Failed to pause scan: {str(e)}",
                     "error": str(e)
+                }, 500
+
+    @scan_ns.route('/<string:scan_id>/resume')
+    class ResumeScan(Resource):
+        @scan_ns.response(200, 'Scan resumed successfully')
+        @scan_ns.response(400, 'Cannot resume scan')
+        @scan_ns.response(404, 'Scan not found')
+        @scan_ns.response(500, 'Internal server error')
+        def post(self, scan_id):
+            """Resume a paused or crashed scan"""
+            request_id = getattr(g, 'request_id', str(uuid.uuid4()))
+
+            try:
+                result = extraction_service.resume_scan(scan_id)
+
+                if result.get('success'):
+                    executor.submit(
+                        asyncio.run,
+                        extraction_service.execute_scan(scan_id)
+                    )
+                    logger.info(
+                        "Scan resume requested successfully",
+                        extra={
+                            'request_id': request_id,
+                            'scan_id': scan_id
+                        }
+                    )
+                    return result, 200
+
+                return result, 400
+
+            except Exception:
+                logger.exception(
+                    "Failed to resume scan",
+                    extra={
+                        'request_id': request_id,
+                        'scan_id': scan_id
+                    }
+                )
+                return {
+                    'success': False,
+                    'scanId': scan_id,
+                    'message': 'Internal server error'
                 }, 500
 
 

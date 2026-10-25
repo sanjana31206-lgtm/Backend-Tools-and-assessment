@@ -1,7 +1,6 @@
 import dlt
 import os
 import logging
-import asyncio
 from typing import Dict, List, Optional, Any
 from datetime import datetime, timezone
 
@@ -79,11 +78,21 @@ class ExtractionService:
             latest_checkpoint = self.job_service.get_latest_checkpoint(job_id)
 
             if latest_checkpoint and latest_checkpoint.get("cursor"):
+                checkpoint_data = latest_checkpoint.get("checkpoint_data") or {}
+
                 resume_from = {
                     "cursor": latest_checkpoint["cursor"],
                     "page_number": latest_checkpoint.get("pageNumber", 0),
                     "records_processed": latest_checkpoint.get("recordsProcessed", 0),
+                    "phase": latest_checkpoint.get("phase"),
+                    "checkpoint_data": checkpoint_data,
+                    "records_completed_in_page": (
+                        checkpoint_data.get("records_completed_in_page", 0)
+                        if latest_checkpoint.get("phase") == "main_data_paused_mid_page"
+                        else 0
+                    ),
                 }
+
                 self.logger.info(
                     "Resuming from checkpoint",
                     extra={
@@ -164,7 +173,7 @@ class ExtractionService:
             )
 
             # Start background task
-            asyncio.create_task(self._execute_scan_with_setup(request_config))
+            await self._execute_scan_with_setup(request_config)
 
             log_business_event(
                 self.logger,
@@ -253,7 +262,7 @@ class ExtractionService:
                 extra={"operation": "scan_setup", "scan_id": scan_id},
             )
 
-            await self._execute_scan(scan_id)
+            await self.execute_scan(scan_id)
 
         except Exception as e:
             self.logger.error(
@@ -278,7 +287,7 @@ class ExtractionService:
             except Exception:
                 pass
 
-    async def _execute_scan(self, job_id: str):
+    async def execute_scan(self, job_id: str):
         """Execute the data extraction pipeline"""
         try:
             job = self.job_service.get_job(job_id, decrypt=True)
@@ -349,16 +358,20 @@ class ExtractionService:
                 "completed_at": datetime.now(timezone.utc).isoformat(),
             }
             current_job = self.job_service.get_job(job_id)
-            if current_job and current_job.get("status") == JobStatus.CANCELLED.value:
+            if current_job and current_job.get("status") in [
+                JobStatus.CANCELLED.value,
+                JobStatus.PAUSED.value,
+            ]:
                 self.logger.info(
-                    "Job was cancelled during execution, keeping cancelled status",
-                    extra={"operation": "execute_scan", "job_id": job_id}
+                    "Job was paused or cancelled during execution; preserving status",
+                    extra={
+                        "operation": "execute_scan",
+                        "job_id": job_id,
+                        "status": current_job.get("status"),
+                    },
                 )
-                return  # Don't mark as completed
-            
+                return
             # Only complete if not cancelled
-            self.job_service.complete_job(job_id, records_extracted, metadata)
-
             self.job_service.complete_job(job_id, records_extracted, metadata)
 
             self.logger.info(
@@ -398,12 +411,8 @@ class ExtractionService:
     def pause_scan(self, scan_id: str) -> Dict[str, Any]:
         return self.job_service.pause_job(scan_id)
 
-    async def resume_scan(self, scan_id: str) -> Dict[str, Any]:
-        result = self.job_service.resume_job(scan_id)
-        if result.get("success"):
-            # Start background execution task
-            asyncio.create_task(self._execute_scan(scan_id))
-        return result
+    def resume_scan(self, scan_id: str) -> Dict[str, Any]:
+        return self.job_service.resume_job(scan_id)
 
     def get_scan_status(self, scan_id: str) -> Optional[Dict[str, Any]]:
         """Get scan status"""
