@@ -298,6 +298,12 @@ class ExtractionService:
                 )
                 return
 
+            # Transition RESUMING → RUNNING so crash detection can observe the job
+            # and the status is accurate during extraction.
+            if job.get("status") == JobStatus.RESUMING.value:
+                self.job_service.update_job_status(job_id, JobStatus.RUNNING)
+                self.job_service.update_job_heartbeat(job_id)
+
             self.logger.info(
                 "Starting pipeline execution",
                 extra={"operation": "execute_scan", "job_id": job_id},

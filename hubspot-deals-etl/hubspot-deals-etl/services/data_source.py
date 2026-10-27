@@ -15,10 +15,10 @@ def create_data_source(
     resume_from: Optional[Dict[str, Any]] = None,
 ):
     """
-    Create DLT source function for Hubspot_Deals data extraction with checkpoint support
+    Create DLT source function for HubSpot deals data extraction with checkpoint support
     """
     logger = get_logger(__name__)
-    api_service = APIService(base_url="https://api.hubapi.com" , test_delay_seconds=1)
+    api_service = APIService(base_url="https://api.hubapi.com")
 
     access_token = auth_config.get("accessToken")
     if not access_token:
@@ -40,9 +40,8 @@ def create_data_source(
     @dlt.resource(name="hubspot_deals", write_disposition="replace", primary_key="id")
     def get_main_data() -> Iterator[Dict[str, Any]]:
         """
-        Extract main data from Hubspot_Deals API with checkpoint support
-
-                """
+        Extract deals from HubSpot CRM API with checkpoint support
+        """
 
         # Initialize state
         if resume_from:
@@ -72,7 +71,8 @@ def create_data_source(
         pause_check_interval = 1  # Check for pause more frequently than cancel
         job_id = filters.get("scan_id", "unknown")
 
-        while page_count < 1000:  # Safety limit
+        page_limit = 1000
+        while page_count < page_limit:  # Safety limit
             try:
                 # Check for cancellation
                 if page_count % cancel_check_interval == 0:
@@ -355,7 +355,6 @@ def create_data_source(
                             },
                         )
 
-                
                 if (
                     data.get("paging")
                     and data["paging"].get("next")
@@ -434,5 +433,18 @@ def create_data_source(
                         pass
 
                 raise e
+
+        # If we exited the loop because the safety limit was reached and there
+        # are still more pages, the extraction is incomplete.  Raise so the
+        # caller (DLT pipeline) marks the run as failed rather than completed.
+        if (
+            page_count >= page_limit
+            and after is not None
+        ):
+            raise RuntimeError(
+                f"Extraction stopped at page safety limit ({page_limit}) with "
+                f"more pages remaining (cursor={after!r}). "
+                "The extraction is incomplete."
+            )
 
     return [get_main_data]

@@ -846,10 +846,40 @@ def create_api():
                 result = extraction_service.resume_scan(scan_id)
 
                 if result.get('success'):
-                    executor.submit(
-                        asyncio.run,
-                        extraction_service.execute_scan(scan_id)
-                    )
+                    coro = extraction_service.execute_scan(scan_id)
+                    try:
+                        executor.submit(asyncio.run, coro)
+                    except Exception as submit_exc:
+                        # Close the coroutine to prevent "coroutine was never awaited" warning.
+                        coro.close()
+                        logger.error(
+                            "Failed to submit resume execution; marking job failed",
+                            extra={
+                                'request_id': request_id,
+                                'scan_id': scan_id,
+                                'error': str(submit_exc),
+                            },
+                        )
+                        try:
+                            extraction_service.job_service.fail_job(
+                                scan_id,
+                                f"Executor submission failed: {submit_exc}",
+                            )
+                        except Exception as fail_exc:
+                            logger.error(
+                                "Failed to mark job as failed after submission error",
+                                extra={
+                                    'request_id': request_id,
+                                    'scan_id': scan_id,
+                                    'original_error': str(submit_exc),
+                                    'fail_error': str(fail_exc),
+                                },
+                            )
+                        return {
+                            'success': False,
+                            'scanId': scan_id,
+                            'message': 'Failed to schedule resume execution',
+                        }, 500
                     logger.info(
                         "Scan resume requested successfully",
                         extra={

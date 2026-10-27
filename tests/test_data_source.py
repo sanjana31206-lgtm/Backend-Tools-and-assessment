@@ -1,7 +1,10 @@
-
 import sys
 from pathlib import Path
 from unittest.mock import Mock, patch
+
+import pytest
+import requests
+from dlt.extract.exceptions import ResourceExtractionError
 
 PROJECT_DIR = (
     Path(__file__).resolve().parents[1]
@@ -32,9 +35,7 @@ def test_data_source_extracts_multiple_pages():
         "results": [make_deal(3, "Deal Three")],
     }
 
-    with patch(
-        "services.data_source.APIService"
-    ) as mock_api_class:
+    with patch("services.data_source.APIService") as mock_api_class:
         mock_api = mock_api_class.return_value
         mock_api.get_data.side_effect = [first_page, second_page]
 
@@ -63,23 +64,22 @@ def test_data_source_resumes_mid_page_without_duplicate_records():
     }
 
     pause_state = {"calls": 0}
-checkpoints = []
+    checkpoints = []
 
-def pause_callback(job_id):
-    pause_state["calls"] += 1
-
-    # First call: before fetching the page.
-    # Second call: before processing the first record.
-    # Third call: before processing the second record.
-    return pause_state["calls"] >= 3
+    def pause_callback(job_id):
+        pause_state["calls"] += 1
+        return pause_state["calls"] >= 3
 
     def checkpoint_callback(job_id, checkpoint):
         checkpoints.append(checkpoint)
 
     with patch("services.data_source.APIService") as mock_api_class:
         mock_api = mock_api_class.return_value
-        mock_api.get_data.return_value = page
-
+        mock_api.get_data.side_effect = [
+            page,
+            page,
+            {"results": []},
+        ]
         first_source = create_data_source(
             job_config={"organizationId": "test-org"},
             auth_config={"accessToken": "fake-test-token"},
@@ -120,7 +120,7 @@ def pause_callback(job_id):
     assert all_ids == ["1", "2", "3"]
     assert len(all_ids) == len(set(all_ids))
 
-    
+
 def test_data_source_preserves_contact_and_company_associations():
     page = {
         "results": [
@@ -161,3 +161,88 @@ def test_data_source_preserves_contact_and_company_associations():
         == "contacts,companies"
     )
 
+
+def test_data_source_handles_429_during_pagination():
+    """A 429 raised by get_data during pagination propagates (wrapped by DLT) correctly."""
+    first_page = {
+        "results": [make_deal(1, "Deal One")],
+        "paging": {"next": {"after": "cursor-page-2"}},
+    }
+
+    with patch("services.data_source.APIService") as mock_api_class:
+        mock_api = mock_api_class.return_value
+        mock_api.get_data.side_effect = [
+            first_page,
+            requests.exceptions.HTTPError("429 Too Many Requests"),
+        ]
+
+        source_factory = create_data_source(
+            job_config={"organizationId": "test-org"},
+            auth_config={"accessToken": "fake-test-token"},
+            filters={"scan_id": "test-scan"},
+        )
+
+        with pytest.raises((requests.exceptions.HTTPError, ResourceExtractionError)):
+            list(source_factory[0])
+
+    assert mock_api.get_data.call_count == 2
+
+
+def test_data_source_deals_without_associations():
+    """Deals with no associations produce empty id lists without errors."""
+    page = {
+        "results": [
+            {
+                "id": "99",
+                "properties": {"dealname": "No Assoc Deal", "amount": "50"},
+            }
+        ]
+    }
+
+    with patch("services.data_source.APIService") as mock_api_class:
+        mock_api = mock_api_class.return_value
+        mock_api.get_data.return_value = page
+
+        source_factory = create_data_source(
+            job_config={"organizationId": "test-org"},
+            auth_config={"accessToken": "fake-test-token"},
+            filters={"scan_id": "test-scan"},
+        )
+
+        records = list(source_factory[0])
+
+    assert records[0]["associated_contact_ids"] == []
+    assert records[0]["associated_company_ids"] == []
+
+
+def test_data_source_raises_on_page_safety_limit():
+    """When the 1000-page safety limit is hit with more pages remaining,
+    the generator must raise RuntimeError rather than silently completing."""
+    counter = {"n": 0}
+
+    def _always_more_page(*args, **kwargs):
+        counter["n"] += 1
+        return {
+            "results": [{"id": str(counter["n"]), "properties": {}}],
+            "paging": {"next": {"after": f"cursor-{counter['n']}"}},
+        }
+
+    with patch("services.data_source.APIService") as mock_api_class:
+        mock_api = mock_api_class.return_value
+        mock_api.get_data.side_effect = _always_more_page
+
+        source_factory = create_data_source(
+            job_config={"organizationId": "test-org"},
+            auth_config={"accessToken": "fake-test-token"},
+            filters={"scan_id": "test-scan"},
+        )
+
+        with pytest.raises((RuntimeError, Exception)) as exc_info:
+            list(source_factory[0])
+
+    # The raised exception must be our safety-limit RuntimeError (possibly
+    # wrapped by DLT's ResourceExtractionError).
+    full_msg = str(exc_info.value).lower()
+    assert "safety limit" in full_msg or "incomplete" in full_msg, (
+        f"Expected safety-limit error, got: {exc_info.value}"
+    )
