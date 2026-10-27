@@ -12,12 +12,13 @@ from loki_logger import get_logger, log_api_call
 
 class APIService:
     """
-    Service for interacting with Hubspot_Deals APIs
+    Service for interacting with HubSpot APIs
     """
 
-    def __init__(self, base_url: str = "https://api.hubapi.com", test_delay_seconds: float = 0):
+    def __init__(self, base_url: str = "https://api.hubapi.com", test_delay_seconds: float = 0, max_retries: int = 2):
         self.base_url = os.getenv("HUBSPOT_API_BASE_URL", base_url).rstrip('/')
-        self.test_delay_seconds = test_delay_seconds  # Add configurable delay for testing
+        self.test_delay_seconds = test_delay_seconds
+        self.max_retries = max_retries
         self.logger = get_logger(__name__)
         self.session = requests.Session()
 
@@ -25,7 +26,7 @@ class APIService:
         self.session.headers.update({
             'Content-Type': 'application/json',
             'Accept': 'application/json',
-            'User-Agent': 'Hubspot_Deals-Data-Extraction-Service/1.0'
+            'User-Agent': 'HubSpot-Deals-Data-Extraction-Service/1.0'
         })
 
         self.logger.debug(
@@ -38,7 +39,7 @@ class APIService:
         )
 
     def set_access_token(self, token: str):
-        """Set the Hubspot_Deals API access token"""
+        """Set the HubSpot API access token"""
         self.session.headers.update({
             'Authorization': f'Bearer {token}'
         })
@@ -50,7 +51,7 @@ class APIService:
                  after: Optional[str] = None,
                  **kwargs) -> Dict[str, Any]:
         """
-        Get data from Hubspot_Deals API with optional test delay
+        Get data from HubSpot Deals API with optional test delay
         """
         start_time = datetime.now(timezone.utc)
 
@@ -97,13 +98,21 @@ class APIService:
             # HubSpot CRM v3 Deals endpoint
             url = f"{self.base_url}/crm/v3/objects/deals"
 
-            max_attempts = 2
+            # Clamp to at least 1 so the request is always attempted once
+            # and `response` is never left as None after the loop.
+            max_attempts = max(1, self.max_retries)
             timeout = (5, 30)
-            retryable_statuses = {429}
+            retryable_statuses = {429, 500, 502, 503, 504}
+            retryable_network_errors = (
+                requests.exceptions.Timeout,
+                requests.exceptions.ConnectionError,
+            )
 
             response = None
+            last_network_error = None
 
             for attempt in range(max_attempts):
+                last_network_error = None
                 try:
                     response = self.session.get(
                         url,
@@ -111,38 +120,66 @@ class APIService:
                         headers=headers,
                         timeout=timeout
                     )
-                except (
-                    requests.exceptions.Timeout,
-                    requests.exceptions.ConnectionError
-                ):
-                    raise
+                except retryable_network_errors as exc:
+                    last_network_error = exc
+                    if attempt == max_attempts - 1:
+                        self.logger.error(
+                            "Retries exhausted after network error",
+                            extra={
+                                "operation": "get_data",
+                                "attempt": attempt + 1,
+                                "error": str(exc),
+                            },
+                        )
+                        raise
+                    delay = min(2 ** attempt, 30)
+                    self.logger.warning(
+                        "Retryable network error; retrying",
+                        extra={
+                            "operation": "get_data",
+                            "attempt": attempt + 1,
+                            "retry_delay": delay,
+                            "error": str(exc),
+                        },
+                    )
+                    time.sleep(delay)
+                    continue
 
                 if response.status_code not in retryable_statuses:
                     break
 
                 if attempt == max_attempts - 1:
+                    self.logger.error(
+                        "Retries exhausted",
+                        extra={
+                            "operation": "get_data",
+                            "status_code": response.status_code,
+                            "attempt": attempt + 1,
+                        },
+                    )
                     response.raise_for_status()
                     break
 
-                retry_after = response.headers.get("Retry-After")
+                # Determine delay: honour Retry-After for 429, else exponential backoff
                 delay = None
-
-                if retry_after:
-                    try:
-                        delay = max(0, float(retry_after))
-                    except ValueError:
+                if response.status_code == 429:
+                    retry_after = response.headers.get("Retry-After")
+                    if retry_after:
                         try:
-                            retry_date = parsedate_to_datetime(retry_after)
-                            if retry_date.tzinfo is None:
-                                retry_date = retry_date.replace(
-                                    tzinfo=timezone.utc
+                            delay = max(0, float(retry_after))
+                        except ValueError:
+                            try:
+                                retry_date = parsedate_to_datetime(retry_after)
+                                if retry_date.tzinfo is None:
+                                    retry_date = retry_date.replace(
+                                        tzinfo=timezone.utc
+                                    )
+                                delay = max(
+                                    0,
+                                    (retry_date - datetime.now(timezone.utc)).total_seconds()
                                 )
-                            delay = max(
-                                0,
-                                (retry_date - datetime.now(timezone.utc)).total_seconds()
-                            )
-                        except (ValueError, TypeError, OverflowError):
-                            delay = None
+                            except (ValueError, TypeError, OverflowError):
+                                delay = None
 
                 if delay is None:
                     delay = min(2 ** attempt, 30)
@@ -162,7 +199,7 @@ class APIService:
 
             if response.status_code in [401, 403, 404]:
                 self.logger.error(
-                    "HubSpot API error",
+                    "HubSpot API permanent error",
                     extra={
                         "operation": "get_data",
                         "status_code": response.status_code,
@@ -223,7 +260,8 @@ class APIService:
 
     def validate_token(self, access_token: str) -> bool:
         """
-        Validate Hubspot_Deals API access token
+        Validate HubSpot API access token by probing the CRM deals endpoint.
+        Returns True only on HTTP 200; treats 401/403 as invalid token.
         """
         try:
             self.logger.debug(
@@ -236,11 +274,10 @@ class APIService:
                 'Content-Type': 'application/json'
             }
 
-            # Validate access using the HubSpot CRM deals endpoint.
             url = f"{self.base_url}/crm/v3/objects/deals"
             params = {'limit': 1}
 
-            response = self.session.get(url, params=params, headers=headers)
+            response = self.session.get(url, params=params, headers=headers, timeout=(5, 10))
             is_valid = response.status_code == 200
 
             if is_valid:
@@ -360,7 +397,7 @@ class APIService:
             return None
     def test_connection(self, access_token: str) -> Dict[str, Any]:
         """
-        Test connection to Hubspot_Deals API
+        Test connection to HubSpot API
         """
         self.logger.info(
             "Testing API connection",
